@@ -33,3 +33,7 @@ Thumbs.db
 
 # Dev runtime data (demo-backend)
 data/users.json
+
+# --- security: local env & deps ---
+.env.local
+.env.*.local

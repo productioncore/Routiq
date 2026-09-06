@@ -38,26 +38,34 @@ const finalizeMigrationInternal = async (user: IUser, res: Response): Promise<vo
             return;
         }
 
-        const newEmail = user.newEmailPending.toLowerCase();
+        // SECURITY: Re-verify tokenVersion from DB to prevent race conditions
+        const currentUser = await User.findById(user._id).select('+bio +avatar +displayName +loginCount +lastLogin +provider +providerId +createdAt +tokenVersion');
+        if (!currentUser) {
+            res.status(404).json({ success: false, message: 'User not found' });
+            return;
+        }
+        // Verify tokenVersion matches (prevents stale request race)
+        if (currentUser.tokenVersion !== user.tokenVersion) {
+            res.status(409).json({ success: false, message: 'Concurrent modification detected — please retry' });
+            return;
+        }
+
+        const newEmail = currentUser.newEmailPending?.toLowerCase();
+        if (!newEmail) {
+            res.status(400).json({ success: false, message: 'No pending migration' });
+            return;
+        }
         
         const existingUserId = await findUserIdByPrimaryEmail(newEmail);
         const existingUserWithNewEmail = existingUserId ? await User.findById(existingUserId) : null;
         
         if (existingUserWithNewEmail) {
             // If it's a different user (not the same _id), we need to merge accounts
-            if (existingUserWithNewEmail._id.toString() !== user._id.toString()) {
+            if (existingUserWithNewEmail._id.toString() !== currentUser._id.toString()) {
                 console.log(`⚠️  User with new email ${newEmail} already exists. Merging accounts...`);
                 
-                // CRITICAL: Reload the original user to ensure we have ALL fields including bio
-                // Use select to explicitly include bio and all other fields
-                const originalUser = await User.findById(user._id).select('+bio +avatar +displayName +loginCount +lastLogin +provider +providerId +createdAt');
-                if (!originalUser) {
-                    res.status(404).json({ success: false, message: 'Original user not found' });
-                    return;
-                }
-                
                 // FLEXIBLE: Extract all user data using the extensible system
-                const preservedData = await extractUserData(originalUser);
+                const preservedData = await extractUserData(currentUser);
                 logPreservedData(preservedData, 'Account Merge');
                 
                 // CRITICAL: DELETE the existing user FIRST before updating email to avoid duplicate key error
@@ -67,29 +75,45 @@ const finalizeMigrationInternal = async (user: IUser, res: Response): Promise<vo
                 console.log(`✅ Deleted existing user ${existingUserId} with email ${newEmail} before updating original user`);
                 
                 // Now update the original user with new email (no duplicate key error)
-                originalUser.previousEmail = originalUser.email;
-                originalUser.email = newEmail;
-                originalUser.migrationExpiry = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
-                originalUser.lastMigrationDate = new Date();
-                originalUser.isEmailVerified = true;
+                // Use atomic update with version check to prevent race conditions
+                const updateResult = await User.findOneAndUpdate(
+                    { _id: currentUser._id, tokenVersion: currentUser.tokenVersion },
+                    {
+                        $set: {
+                            previousEmail: currentUser.email,
+                            email: newEmail,
+                            migrationExpiry: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+                            lastMigrationDate: new Date(),
+                            isEmailVerified: true,
+                            newEmailPending: undefined,
+                            migrationToken: undefined,
+                            migrationTokenExpires: undefined,
+                            currentEmailVerified: undefined,
+                            newEmailVerified: undefined,
+                            currentEmailToken: undefined,
+                            newEmailToken: undefined,
+                        },
+                        $inc: { tokenVersion: 1 },
+                    }
+                );
                 
-                // FLEXIBLE: Apply preserved data (bio, displayName, avatar, etc.)
-                // This can be extended to include posts, reels, etc. in the future
-                applyUserData(originalUser, preservedData, newEmail);
+                if (!updateResult) {
+                    // Version mismatch — concurrent modification
+                    res.status(409).json({ success: false, message: 'Concurrent modification detected — please retry' });
+                    return;
+                }
                 
-                // CRITICAL: Explicitly mark bio as modified and ensure it's saved
-                originalUser.markModified('bio');
-                originalUser.markModified('displayName');
-                originalUser.markModified('avatar');
-                
-                // Update user reference
-                user = originalUser;
+                // Apply preserved data to the updated user
+                applyUserData(updateResult, preservedData, newEmail);
+                updateResult.markModified('bio');
+                updateResult.markModified('displayName');
+                updateResult.markModified('avatar');
                 
                 // Update migration history - mark pending as success
-                if (!user.migrationHistory) {
-                    user.migrationHistory = [];
+                if (!updateResult.migrationHistory) {
+                    updateResult.migrationHistory = [];
                 }
-                const pendingMigration = user.migrationHistory.find(
+                const pendingMigration = updateResult.migrationHistory.find(
                     (m: any) => m.status === 'pending' && m.toEmail === newEmail
                 );
                 if (pendingMigration) {
@@ -99,8 +123,8 @@ const finalizeMigrationInternal = async (user: IUser, res: Response): Promise<vo
                     pendingMigration.newEmailVerified = true;
                     pendingMigration.pendingFrom = undefined; // Both verified
                 } else {
-                    user.migrationHistory.push({
-                        fromEmail: user.previousEmail || user.email,
+                    updateResult.migrationHistory.push({
+                        fromEmail: updateResult.previousEmail || updateResult.email,
                         toEmail: newEmail,
                         status: 'success',
                         initiatedAt: new Date(),
@@ -113,11 +137,11 @@ const finalizeMigrationInternal = async (user: IUser, res: Response): Promise<vo
                 }
                 
                 // CRITICAL: Save with explicit options to ensure bio is saved
-                await user.save({ validateBeforeSave: true });
-                await syncIdentityIndexesFromUser(user);
+                await updateResult.save({ validateBeforeSave: true });
+                await syncIdentityIndexesFromUser(updateResult);
                 
                 // CRITICAL: Verify bio was saved immediately after save
-                const verifyBio = await User.findById(user._id).select('+bio');
+                const verifyBio = await User.findById(updateResult._id).select('+bio');
                 if (verifyBio) {
                     console.log(`🔍 Bio verification after save: "${verifyBio.bio || 'EMPTY'}" (Expected: "${preservedData.bio || 'EMPTY'}")`);
                     if (verifyBio.bio !== preservedData.bio) {
@@ -131,63 +155,105 @@ const finalizeMigrationInternal = async (user: IUser, res: Response): Promise<vo
                     }
                 }
                 
-                console.log(`✅ Migration completed. User ${user._id} now has email ${newEmail}`);
-                console.log(`✅ Bio in migrated account: "${user.bio || 'EMPTY'}"`);
+                console.log(`✅ Migration completed. User ${updateResult._id} now has email ${newEmail}`);
+                console.log(`✅ Bio in migrated account: "${updateResult.bio || 'EMPTY'}"`);
+                
+                // Issue new tokens with incremented tokenVersion
+                const tokens = generateTokenPair(updateResult);
+                await persistSessionTokens(updateResult._id, tokens.accessToken, tokens.refreshToken, updateResult.tokenVersion);
+                setAuthCookies(res, tokens.refreshToken);
+                
+                res.status(200).json({
+                    success: true,
+                    message: 'Migration completed successfully',
+                    user: {
+                        id: updateResult._id,
+                        email: updateResult.email,
+                        displayName: updateResult.displayName,
+                        avatar: updateResult.avatar,
+                        bio: updateResult.bio,
+                        isEmailVerified: updateResult.isEmailVerified,
+                    },
+                    ...publicTokenFields(tokens.accessToken, tokens.refreshToken),
+                });
+                return;
             } else {
                 // Same user, just update email
-                user.previousEmail = user.email;
-                user.email = newEmail;
-                user.migrationExpiry = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
-                user.lastMigrationDate = new Date();
-                user.isEmailVerified = true;
+                const updateResult = await User.findOneAndUpdate(
+                    { _id: currentUser._id, tokenVersion: currentUser.tokenVersion },
+                    {
+                        $set: {
+                            previousEmail: currentUser.email,
+                            email: newEmail,
+                            migrationExpiry: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
+                            lastMigrationDate: new Date(),
+                            isEmailVerified: true,
+                            newEmailPending: undefined,
+                            migrationToken: undefined,
+                            migrationTokenExpires: undefined,
+                            currentEmailVerified: undefined,
+                            newEmailVerified: undefined,
+                            currentEmailToken: undefined,
+                            newEmailToken: undefined,
+                        },
+                        $inc: { tokenVersion: 1 },
+                    }
+                );
                 
-                // Update migration history - reload user to get latest
-                const userWithHistory = await User.findById(user._id);
-                if (userWithHistory) {
-                    if (!userWithHistory.migrationHistory) {
-                        userWithHistory.migrationHistory = [];
-                    }
-                    // Find and update the pending migration entry
-                    const pendingMigration = userWithHistory.migrationHistory.find(
-                        (m: any) => m.status === 'pending' && m.toEmail === newEmail
-                    );
-                    if (pendingMigration) {
-                        pendingMigration.status = 'success';
-                        pendingMigration.completedAt = new Date();
-                        pendingMigration.currentEmailVerified = true;
-                        pendingMigration.newEmailVerified = true;
-                        pendingMigration.pendingFrom = undefined; // Both verified
-                        console.log(`✅ Migration history updated: ${user.email} -> ${newEmail} marked as success`);
-                    } else {
-                        // If no pending entry found, create one
-                        userWithHistory.migrationHistory.push({
-                            fromEmail: user.email,
-                            toEmail: newEmail,
-                            status: 'success',
-                            initiatedAt: new Date(),
-                            completedAt: new Date(),
-                            revertedAt: undefined as any,
-                            currentEmailVerified: true,
-                            newEmailVerified: true,
-                            pendingFrom: undefined
-                        });
-                        console.log(`⚠️  No pending migration found, created new history entry`);
-                    }
-                    // Update user reference
-                    user = userWithHistory;
+                if (!updateResult) {
+                    res.status(409).json({ success: false, message: 'Concurrent modification detected — please retry' });
+                    return;
                 }
                 
-                // Cleanup migration fields
-                user.migrationToken = undefined;
-                user.migrationTokenExpires = undefined;
-                user.newEmailPending = undefined;
-                user.currentEmailVerified = undefined;
-                user.newEmailVerified = undefined;
-                user.currentEmailToken = undefined;
-                user.newEmailToken = undefined;
+                // Update migration history
+                if (!updateResult.migrationHistory) {
+                    updateResult.migrationHistory = [];
+                }
+                const pendingMigration = updateResult.migrationHistory.find(
+                    (m: any) => m.status === 'pending' && m.toEmail === newEmail
+                );
+                if (pendingMigration) {
+                    pendingMigration.status = 'success';
+                    pendingMigration.completedAt = new Date();
+                    pendingMigration.currentEmailVerified = true;
+                    pendingMigration.newEmailVerified = true;
+                    pendingMigration.pendingFrom = undefined; // Both verified
+                } else {
+                    updateResult.migrationHistory.push({
+                        fromEmail: updateResult.email,
+                        toEmail: newEmail,
+                        status: 'success',
+                        initiatedAt: new Date(),
+                        completedAt: new Date(),
+                        revertedAt: undefined as any,
+                        currentEmailVerified: true,
+                        newEmailVerified: true,
+                        pendingFrom: undefined
+                    });
+                }
                 
-                await user.save();
-                await syncIdentityIndexesFromUser(user);
+                await updateResult.save({ validateBeforeSave: true });
+                await syncIdentityIndexesFromUser(updateResult);
+                
+                // Issue new tokens
+                const tokens = generateTokenPair(updateResult);
+                await persistSessionTokens(updateResult._id, tokens.accessToken, tokens.refreshToken, updateResult.tokenVersion);
+                setAuthCookies(res, tokens.refreshToken);
+                
+                res.status(200).json({
+                    success: true,
+                    message: 'Migration completed successfully',
+                    user: {
+                        id: updateResult._id,
+                        email: updateResult.email,
+                        displayName: updateResult.displayName,
+                        avatar: updateResult.avatar,
+                        bio: updateResult.bio,
+                        isEmailVerified: updateResult.isEmailVerified,
+                    },
+                    ...publicTokenFields(tokens.accessToken, tokens.refreshToken),
+                });
+                return;
             }
         } else {
             // No existing user, proceed with normal migration

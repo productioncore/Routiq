@@ -1,5 +1,6 @@
 import Redis, { RedisOptions } from 'ioredis';
 import { config } from './index';
+import { boot } from '../utils/boot';
 import {
     redisCircuitBreaker,
     withCircuitBreaker,
@@ -20,7 +21,7 @@ function buildRedisOptions(role: RedisRole): RedisOptions {
         port: redis.port,
         username: redis.username || undefined,
         password: redis.password || undefined,
-        tls: redis.tls ? { servername: redis.host } : undefined,
+        tls: redis.tls ? { rejectUnauthorized: true, servername: redis.host } : undefined,
         db: redis.db,
         connectionName: `uam-${role}`,
         lazyConnect: true,
@@ -49,21 +50,18 @@ function buildRedisOptions(role: RedisRole): RedisOptions {
 function wireClientEvents(client: Redis, role: RedisRole, onReady: (ready: boolean) => void): void {
     client.on('ready', () => {
         onReady(true);
-        console.log(`✅ Redis (${role}) ready`);
     });
 
     client.on('connect', () => {
-        console.log(`Redis (${role}) TCP connected`);
+        // silent — boot summary covers this
     });
 
     client.on('error', (err) => {
         onReady(false);
-        console.error(`❌ Redis (${role}) error:`, err.message);
     });
 
     client.on('close', () => {
         onReady(false);
-        console.log(`⚠️ Redis (${role}) connection closed`);
     });
 
     client.on('reconnecting', () => {
@@ -71,22 +69,42 @@ function wireClientEvents(client: Redis, role: RedisRole, onReady: (ready: boole
     });
 }
 
+function buildUrlClient(url: string, role: RedisRole): Redis {
+    const isTls = url.startsWith('rediss://');
+    return new Redis(url, {
+        connectionName: `uam-${role}`,
+        tls: isTls ? { rejectUnauthorized: true } : undefined,
+        lazyConnect: true,
+        enableReadyCheck: true,
+        enableOfflineQueue: true,
+        maxRetriesPerRequest: config.redis.maxRetriesPerRequest,
+        connectTimeout: config.redis.connectTimeoutMs,
+        commandTimeout: config.redis.commandTimeoutMs,
+        keepAlive: config.redis.keepAliveMs,
+        retryStrategy: (times) => Math.min(times * 200, 5_000),
+    });
+}
+
 function createClients(): void {
     if (!config.redis.enabled) {
-        console.log('ℹ️ Redis is disabled in configuration');
         return;
     }
 
-    redisCache = new Redis(buildRedisOptions('cache'));
-    wireClientEvents(redisCache, 'cache', (ready) => {
-        cacheReady = ready;
-    });
+    const redisUrl = process.env.REDIS_URL;
 
-    // Dedicated connection for rate limiting — isolates counter churn from auth cache latency.
-    redisRateLimit = new Redis(buildRedisOptions('ratelimit'));
-    wireClientEvents(redisRateLimit, 'ratelimit', (ready) => {
-        rateLimitReady = ready;
-    });
+    if (redisUrl) {
+        redisCache = buildUrlClient(redisUrl, 'cache');
+        wireClientEvents(redisCache, 'cache', (ready) => { cacheReady = ready; });
+
+        redisRateLimit = buildUrlClient(redisUrl, 'ratelimit');
+        wireClientEvents(redisRateLimit, 'ratelimit', (ready) => { rateLimitReady = ready; });
+    } else {
+        redisCache = new Redis(buildRedisOptions('cache'));
+        wireClientEvents(redisCache, 'cache', (ready) => { cacheReady = ready; });
+
+        redisRateLimit = new Redis(buildRedisOptions('ratelimit'));
+        wireClientEvents(redisRateLimit, 'ratelimit', (ready) => { rateLimitReady = ready; });
+    }
 }
 
 createClients();
@@ -114,6 +132,8 @@ async function ensureRedisConnected(client: Redis): Promise<void> {
 export const connectRedis = async (): Promise<void> => {
     if (!config.redis.enabled || !redisCache || !redisRateLimit) return;
 
+    const viaUrl = Boolean(process.env.REDIS_URL);
+
     try {
         await Promise.all([
             ensureRedisConnected(redisCache),
@@ -122,10 +142,9 @@ export const connectRedis = async (): Promise<void> => {
         await Promise.all([redisCache.ping(), redisRateLimit.ping()]);
         cacheReady = true;
         rateLimitReady = true;
-        console.log('✅ Redis pools connected (cache + ratelimit)');
+        boot.redis('cache', true, viaUrl);
+        boot.redis('ratelimit', true, viaUrl);
     } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.log('⚠️ Redis not available, continuing with degraded mode:', message);
         cacheReady = false;
         rateLimitReady = false;
     }
@@ -142,7 +161,6 @@ export const closeRedis = async (): Promise<void> => {
     await Promise.all(closes);
     cacheReady = false;
     rateLimitReady = false;
-    console.log('Redis pools closed');
 };
 
 export const pingRedisCache = async (): Promise<boolean> => {

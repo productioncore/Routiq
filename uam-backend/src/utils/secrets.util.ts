@@ -8,25 +8,25 @@ const DEV_JWT_ACCESS = new Set([
     '',
     'default-access-secret',
     'super_secret_key_for_hmac_sha256',
-    'super_secret_key_for_hmac_sha256_change_in_prod',
-    'change_me_use_a_long_random_secret_at_least_32_chars',
+    'CHANGE_ME_JWT_ACCESS_SECRET',
+    'CHANGE_ME_JWT_ACCESS_SECRET',
 ]);
 
 const DEV_JWT_REFRESH = new Set([
     '',
     'default-refresh-secret',
-    'uam_refresh_secret_change_in_prod',
+    'CHANGE_ME_JWT_REFRESH_SECRET',
 ]);
 
 const DEV_ADMIN_KEYS = new Set([
-    'change_me_in_production',
+    'CHANGE_ME_ADMIN_API_KEY',
     'change_me_use_a_long_random_admin_key',
 ]);
 
 const DEV_PEPPERS = new Set([
     '',
     'change_me_use_a_long_random_password_pepper_at_least_32_chars',
-    'dev_pepper_change_in_production',
+    'CHANGE_ME_PASSWORD_PEPPER',
 ]);
 
 function isProduction(): boolean {
@@ -71,7 +71,7 @@ function isDevStack(): boolean {
 
 function criticalProductionMisconfig(): string[] {
     const reasons: string[] = [];
-    if (isProduction() && config.security.autoVerifyEmail && !isDevStack()) {
+    if (isProduction() && config.security.autoVerifyEmail) {
         reasons.push('AUTO_VERIFY_EMAIL must not be enabled in production');
     }
     return reasons;

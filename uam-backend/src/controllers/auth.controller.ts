@@ -26,7 +26,6 @@ import { findStoredRefreshToken } from '../utils/refresh-token.util';
 import { sendVerificationEmail, sendPasswordResetEmail } from '../services/email.service';
 import { config } from '../config';
 import { rateLimitConfig } from '../config/rateLimit.config';
-import { handleLoginFailure, resetLoginAttempts } from '../middleware/advancedLimiter';
 import {
     RegisterInput,
     LoginInput,
@@ -261,15 +260,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         }
 
         if (!user) {
-            // Signal failure to rate limiter
-            await handleLoginFailure(req);
-
             res.status(401).json({ success: false, message: 'Invalid email or password' });
             return;
         }
 
         if (user.provider !== 'local') {
-            await handleLoginFailure(req);
             res.status(401).json({
                 success: false,
                 message: 'Invalid email or password',
@@ -280,25 +275,12 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
         const isMatch = await user.comparePassword(password);
         if (!isMatch) {
-            // Signal failure to rate limiter
-            const blockUntil = await handleLoginFailure(req);
-
-            if (blockUntil) {
-                res.status(429).json({
-                    success: false,
-                    message: 'Too many failed attempts. Account temporarily blocked.',
-                    blockUntil
-                });
-                return;
-            }
-
             res.status(401).json({ success: false, message: 'Invalid email or password' });
             return;
         }
 
         // 2. Check if Email Verified — same response as wrong password (ADR-0063)
         if (!user.isEmailVerified) {
-            await handleLoginFailure(req);
             res.status(401).json({
                 success: false,
                 message: 'Invalid email or password',
@@ -324,9 +306,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             // Reset for new day
             user.loginCount = 1;
         }
-
-        // Success - Reset Rate Limit
-        await resetLoginAttempts(req);
 
         // Update login stats
         user.lastLogin = new Date();

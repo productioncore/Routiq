@@ -32,12 +32,8 @@ import {
     prepareOAuth,
     getOAuthProviders,
     redeemEmailLink,
-    getVerificationStatus,
     postVerificationStatus,
 } from '../controllers/auth.controller';
-
-import { authLimiter, emailCheckLimiter, passwordResetLimiter, sessionLimiter } from '../middleware/limiter.middleware';
-import { advancedLoginLimiter } from '../middleware/advancedLimiter';
 import { requireCsrf, getCsrfToken } from '../middleware/csrf.middleware';
 import { config } from '../config';
 
@@ -70,23 +66,22 @@ function requireOAuthProvider(provider: 'google' | 'github') {
 router.get('/csrf', getCsrfToken);
 router.get('/oauth/providers', getOAuthProviders);
 
-router.post('/check-email', emailCheckLimiter, validate(emailCheckSchema), checkEmailAvailability);
-router.get('/verification-status', emailCheckLimiter, getVerificationStatus);
-router.post('/verification-status', emailCheckLimiter, validate(verificationPollSchema), postVerificationStatus);
+router.post('/check-email', validate(emailCheckSchema), checkEmailAvailability);
+router.post('/verification-status', validate(verificationPollSchema), postVerificationStatus);
 
-router.post('/redeem-email-link', authLimiter, validate(redeemEmailLinkSchema), redeemEmailLink);
-router.post('/oauth/prepare', authLimiter, validate(oauthPrepareSchema), prepareOAuth);
+router.post('/redeem-email-link', validate(redeemEmailLinkSchema), redeemEmailLink);
+router.post('/oauth/prepare', validate(oauthPrepareSchema), prepareOAuth);
 
-router.post('/register', authLimiter, ...csrfProtected, validate(registerSchema), register);
-router.post('/login', advancedLoginLimiter, ...csrfProtected, validate(loginSchema), login);
-router.post('/verify-email', authLimiter, ...csrfProtected, validate(emailVerifySchema), verifyEmail);
-router.post('/resend-verification', authLimiter, ...csrfProtected, validate(resendVerificationSchema), resendVerification);
+router.post('/register', ...csrfProtected, validate(registerSchema), register);
+router.post('/login', ...csrfProtected, validate(loginSchema), login);
+router.post('/verify-email', ...csrfProtected, validate(emailVerifySchema), verifyEmail);
+router.post('/resend-verification', ...csrfProtected, validate(resendVerificationSchema), resendVerification);
 
-router.post('/forgot-password', passwordResetLimiter, ...csrfProtected, validate(passwordResetRequestSchema), requestPasswordReset);
-router.post('/reset-password', passwordResetLimiter, ...csrfProtected, validate(passwordResetSchema), resetPassword);
-router.post('/refresh-token', sessionLimiter, ...csrfProtected, validate(refreshTokenSchema), refreshAccessToken);
-router.post('/logout', sessionLimiter, ...csrfProtected, logout);
-router.post('/oauth/exchange', authLimiter, ...csrfProtected, validate(oauthExchangeSchema), exchangeOAuthCode);
+router.post('/forgot-password', ...csrfProtected, validate(passwordResetRequestSchema), requestPasswordReset);
+router.post('/reset-password', ...csrfProtected, validate(passwordResetSchema), resetPassword);
+router.post('/refresh-token', ...csrfProtected, validate(refreshTokenSchema), refreshAccessToken);
+router.post('/logout', ...csrfProtected, logout);
+router.post('/oauth/exchange', ...csrfProtected, validate(oauthExchangeSchema), exchangeOAuthCode);
 
 router.get('/me', authenticate, requireVerifiedEmail, getCurrentUser);
 

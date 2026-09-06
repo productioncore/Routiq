@@ -2,31 +2,28 @@ import { pool } from '../db/client';
 import { runMigrations, startTtlSweeper } from '../db/migrations';
 import { backfillIdentityIndexes } from '../services/identity-index.service';
 import { config } from './index';
+import { boot } from '../utils/boot';
 
 let ttlSweeper: NodeJS.Timeout | null = null;
 
 export const connectDatabase = async (): Promise<void> => {
     try {
         await pool.query('SELECT 1');
-        console.log(
-            `✅ PostgreSQL connected (pool max=${config.postgres.pool.max})`,
-        );
+        boot.postgres(true, config.postgres.pool.max);
 
-        await runMigrations();
+        const migrationCount = await runMigrations();
+        boot.migrations(migrationCount);
 
-        // Best-effort identity-index backfill from User rows (safe on boot).
         try {
             const { scanned, synced } = await backfillIdentityIndexes();
-            if (scanned > 0) {
-                console.log(`✅ Identity index backfill: ${synced}/${scanned} users`);
-            }
+            boot.backfill(scanned, synced);
         } catch (err) {
-            console.warn('Identity index backfill skipped:', (err as Error).message);
+            // silent — best-effort
         }
 
         ttlSweeper = startTtlSweeper();
     } catch (error) {
-        console.error('❌ PostgreSQL connection error:', error);
+        boot.postgres(false, 0);
         process.exit(1);
     }
 };

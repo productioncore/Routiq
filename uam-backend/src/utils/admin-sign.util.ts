@@ -32,7 +32,7 @@ export function adminSignHeaders(body: string): AdminSignHeaders {
     };
 
     const key = config.controlPlane.adminApiKey;
-    if (!key || key === 'change_me_in_production') {
+    if (!key || key === 'CHANGE_ME_ADMIN_API_KEY') {
         return headers;
     }
 

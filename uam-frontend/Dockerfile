@@ -1,28 +1,17 @@
 # syntax=docker/dockerfile:1
-# UAM frontend — React SPA behind nginx with same-origin gateway proxy (ADR-0052).
+# UAM frontend — React SPA, calls gateway directly (no nginx proxy).
 
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json* .npmrc ./
 RUN npm install
 COPY . .
-# Same-origin: browser calls /api/* → nginx → gateway → uam-backend
-ENV VITE_API_URL=/api
-RUN npx vite build
+RUN npm run build
 
-FROM nginx:1.27-alpine
-RUN apk add --no-cache gettext \
-    && rm -f /etc/nginx/conf.d/default.conf
-COPY nginx.conf.template /etc/nginx/nginx.conf.template
-COPY cloudflare/cdn-static.conf /etc/nginx/cloudflare/cdn-static.conf
-COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
-COPY --from=build /app/dist /usr/share/nginx/html
-
-EXPOSE 80
-
+FROM node:20-alpine
+RUN npm install -g serve@14
+COPY --from=build /app/dist /app/dist
+EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
-  CMD wget -qO- http://127.0.0.1:80/ >/dev/null 2>&1 || exit 1
-
-ENTRYPOINT ["/docker-entrypoint.sh"]
-COPY cloudflare/security-headers.conf /etc/nginx/cloudflare/security-headers.conf
+  CMD wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1
+CMD ["serve", "-s", "/app/dist", "-l", "8080"]

@@ -81,7 +81,7 @@ export function initTelemetry(): boolean {
     sdk = new NodeSDK({
         resource: resourceFromAttributes({
             [SEMRESATTRS_SERVICE_NAME]: serviceName,
-            [SEMRESATTRS_SERVICE_NAMESPACE]: 'routiq',
+            [SEMRESATTRS_SERVICE_NAMESPACE]: 'nginx-rust-api-gateway',
         }),
         traceExporter: new OTLPTraceExporter(),
         metricReaders: [

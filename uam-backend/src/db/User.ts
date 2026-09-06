@@ -96,6 +96,7 @@ interface UpdateDoc {
     $pull?: Record<string, UpdateOperand>;
     $set?: Record<string, UpdateOperand>;
     $unset?: Record<string, string>;
+    $inc?: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +295,12 @@ async function applyUpdate(filter: Filter, update: UpdateDoc): Promise<User | nu
 
         for (const field of Object.keys(update.$unset ?? {})) {
             values[field] = undefined;
+            changed.add(field);
+        }
+
+        for (const [field, value] of Object.entries(update.$inc ?? {})) {
+            const current = typeof values[field] === 'number' ? values[field] : 0;
+            values[field] = current + value;
             changed.add(field);
         }
 

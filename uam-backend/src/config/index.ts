@@ -3,16 +3,19 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { envBool, envInt } from './env.util';
 
-// .env = safe defaults (committed). .env.dev = secrets (gitignored), overrides when present.
-dotenv.config();
+// Load .env file only if running locally (not in production container)
+const isLocalEnv = process.env.NODE_ENV !== 'production';
+if (isLocalEnv) {
+    dotenv.config();
+}
 const devEnv = resolve(process.cwd(), '.env.dev');
-if (existsSync(devEnv)) {
+if (existsSync(devEnv) && isLocalEnv) {
     dotenv.config({ path: devEnv, override: true });
 }
 
 export const config = {
     port: parseInt(process.env.PORT || '8080', 10),
-    nodeEnv: process.env.NODE_ENV || 'development',
+    nodeEnv: process.env.NODE_ENV || 'production',
 
     postgres: {
         url: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/uam',
@@ -28,20 +31,44 @@ export const config = {
         appName: process.env.PG_APP_NAME || 'uam-backend',
     },
 
-    redis: {
-        enabled: process.env.REDIS_ENABLED !== 'false',
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT || '6379', 10),
-        username: process.env.REDIS_USERNAME || undefined,
-        password: process.env.REDIS_PASSWORD || '',
-        tls: process.env.REDIS_TLS === 'true',
-        db: envInt('REDIS_DB', 0),
-        connectTimeoutMs: envInt('REDIS_CONNECT_TIMEOUT_MS', 10_000),
-        commandTimeoutMs: envInt('REDIS_COMMAND_TIMEOUT_MS', 5_000),
-        keepAliveMs: envInt('REDIS_KEEPALIVE_MS', 30_000),
-        maxRetriesPerRequest: envInt('REDIS_MAX_RETRIES_PER_REQUEST', 3),
-        maxReconnectAttempts: envInt('REDIS_MAX_RECONNECT_ATTEMPTS', 20),
-    },
+    redis: (() => {
+        const redisUrl = process.env.REDIS_URL;
+        if (redisUrl) {
+            try {
+                const url = new URL(redisUrl);
+                return {
+                    enabled: true,
+                    host: url.hostname,
+                    port: parseInt(url.port || '6379', 10),
+                    username: url.username || undefined,
+                    password: url.password || '',
+                    tls: url.protocol === 'rediss:',
+                    db: envInt('REDIS_DB', 0),
+                    connectTimeoutMs: envInt('REDIS_CONNECT_TIMEOUT_MS', 10_000),
+                    commandTimeoutMs: envInt('REDIS_COMMAND_TIMEOUT_MS', 5_000),
+                    keepAliveMs: envInt('REDIS_KEEPALIVE_MS', 30_000),
+                    maxRetriesPerRequest: envInt('REDIS_MAX_RETRIES_PER_REQUEST', 3),
+                    maxReconnectAttempts: envInt('REDIS_MAX_RECONNECT_ATTEMPTS', 20),
+                };
+            } catch {
+                console.warn('⚠️ Invalid REDIS_URL, falling back to individual env vars');
+            }
+        }
+        return {
+            enabled: process.env.REDIS_ENABLED !== 'false',
+            host: process.env.REDIS_HOST || 'localhost',
+            port: parseInt(process.env.REDIS_PORT || '6379', 10),
+            username: process.env.REDIS_USERNAME || undefined,
+            password: process.env.REDIS_PASSWORD || '',
+            tls: process.env.REDIS_TLS === 'true',
+            db: envInt('REDIS_DB', 0),
+            connectTimeoutMs: envInt('REDIS_CONNECT_TIMEOUT_MS', 10_000),
+            commandTimeoutMs: envInt('REDIS_COMMAND_TIMEOUT_MS', 5_000),
+            keepAliveMs: envInt('REDIS_KEEPALIVE_MS', 30_000),
+            maxRetriesPerRequest: envInt('REDIS_MAX_RETRIES_PER_REQUEST', 3),
+            maxReconnectAttempts: envInt('REDIS_MAX_RECONNECT_ATTEMPTS', 20),
+        };
+    })(),
 
     jwt: {
         accessSecret: process.env.JWT_ACCESS_SECRET || 'default-access-secret',
@@ -55,7 +82,6 @@ export const config = {
     security: {
         passwordPepper: process.env.PASSWORD_PEPPER || '',
         defaultHomeRegion: process.env.DEFAULT_HOME_REGION || 'US',
-        // Dev/docker only — skip email verification gate (never enable in production).
         autoVerifyEmail:
             process.env.AUTO_VERIFY_EMAIL === '1'
             || process.env.AUTO_VERIFY_EMAIL === 'true',
@@ -91,7 +117,6 @@ export const config = {
     },
 
     auth: {
-        /** Browser clients use HttpOnly cookies; omit refresh from JSON (ADR-0055). */
         omitRefreshInBody:
             process.env.AUTH_OMIT_REFRESH_IN_BODY === '1'
             || process.env.AUTH_OMIT_REFRESH_IN_BODY === 'true',
@@ -114,10 +139,10 @@ export const config = {
             ),
     },
 
-    /** Control plane — publishes gateway access-token revocations (ADR-0039). */
+    /** Control plane - publishes gateway access-token revocations (ADR-0039). */
     controlPlane: {
         url: process.env.CONTROL_PLANE_URL || 'http://control-plane:8081',
-        adminApiKey: process.env.ADMIN_API_KEY || 'change_me_in_production',
+        adminApiKey: process.env.ADMIN_API_KEY || 'CHANGE_ME_ADMIN_API_KEY',
     },
 
     /** Bearer token required for GET /metrics in production (empty = dev-only open scrape). */

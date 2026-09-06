@@ -62,6 +62,8 @@ export const generateRefreshToken = (user: IUser): string => {
 
     const options: SignOptions = {
         expiresIn: parseExpiry(config.jwt.refreshExpiresIn),
+        issuer: config.jwt.issuer,
+        audience: config.jwt.audience,
     };
 
     return jwt.sign(payload, config.jwt.refreshSecret, options);
@@ -75,6 +77,8 @@ const ACCESS_VERIFY_OPTS: jwt.VerifyOptions = {
 
 const REFRESH_VERIFY_OPTS: jwt.VerifyOptions = {
     algorithms: ['HS256'],
+    issuer: config.jwt.issuer,
+    audience: config.jwt.audience,
 };
 
 export const verifyAccessToken = (token: string): TokenPayload | null => {

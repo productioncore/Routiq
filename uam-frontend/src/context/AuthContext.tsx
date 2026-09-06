@@ -88,9 +88,14 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
     useEffect(() => {
         const initAuth = async () => {
-            await api.ensureCsrf();
-            await refreshUser();
-            setIsLoading(false);
+            try {
+                await api.ensureCsrf();
+                await refreshUser();
+            } catch {
+                // CORS error or gateway unreachable — app still works, just unauthenticated
+            } finally {
+                setIsLoading(false);
+            }
         };
         void initAuth();
     }, [refreshUser]);

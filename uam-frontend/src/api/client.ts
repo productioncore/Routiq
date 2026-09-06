@@ -1,4 +1,4 @@
-// Same-origin in Docker (nginx → gateway). Dev fallback: local uam-backend.
+// Calls gateway directly via VITE_API_URL.
 import {
     generateCodeVerifier,
     generateCodeChallenge,

@@ -25,7 +25,7 @@ const BCRYPT_COST = (() => {
 const DEV_PEPPERS = new Set([
     '',
     'change_me_use_a_long_random_password_pepper_at_least_32_chars',
-    'dev_pepper_change_in_production',
+    'CHANGE_ME_PASSWORD_PEPPER',
 ]);
 
 export const getPepper = (): string => process.env.PASSWORD_PEPPER || '';

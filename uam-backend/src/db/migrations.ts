@@ -89,7 +89,7 @@ export const migrations: Migration[] = [
     },
 ];
 
-export async function runMigrations(): Promise<void> {
+export async function runMigrations(): Promise<number> {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -108,6 +108,7 @@ export async function runMigrations(): Promise<void> {
         client.release();
     }
 
+    let applied = 0;
     for (const migration of migrations) {
         const { rows } = await pool.query(
             `SELECT 1 FROM schema_migrations WHERE name = $1`,
@@ -123,7 +124,7 @@ export async function runMigrations(): Promise<void> {
             await client.query(migration.up);
             await client.query(`INSERT INTO schema_migrations (name) VALUES ($1)`, [migration.name]);
             await client.query('COMMIT');
-            console.log(`Applied migration: ${migration.name}`);
+            applied++;
         } catch (err) {
             await client.query('ROLLBACK');
             throw new Error(`Migration ${migration.name} failed: ${(err as Error).message}`);
@@ -131,6 +132,7 @@ export async function runMigrations(): Promise<void> {
             client.release();
         }
     }
+    return applied;
 }
 
 /**

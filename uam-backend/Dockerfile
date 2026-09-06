@@ -20,6 +20,7 @@ COPY package.json package-lock.json* ./
 RUN npm install --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
+COPY ca.crt /app/ca.crt
 RUN rm -f /app/.env
 
 RUN apk add --no-cache wget \

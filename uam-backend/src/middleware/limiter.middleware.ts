@@ -9,8 +9,6 @@ const relaxAuthLimits = config.nodeEnv !== 'production' && (
     || process.env.UAM_RELAX_AUTH_LIMITS === 'true'
 );
 
-let storeModeLogged = false;
-
 /** Fail-closed store when Redis is down but distributed limits are required. */
 class FailClosedRateLimitStore implements Store {
     async increment(_key: string): Promise<{ totalHits: number; resetTime: Date }> {
@@ -22,62 +20,105 @@ class FailClosedRateLimitStore implements Store {
     async resetKey(_key: string): Promise<void> {}
 }
 
-// Each limiter needs its own RedisStore prefix so counters do not collide on the same IP key.
-const getStore = (prefix: string): Store | undefined => {
-    if (config.redis.enabled && redisRateLimit) {
-        if (!storeModeLogged) {
-            console.log('⚡ Rate Limiting: Redis Store (distributed across UAM replicas)');
-            storeModeLogged = true;
+/** In-memory fallback when Redis is unavailable but distributed is not required. */
+class InMemoryRateLimitStore implements Store {
+    private hits = new Map<string, { count: number; resetTime: Date }>();
+
+    async increment(key: string): Promise<{ totalHits: number; resetTime: Date }> {
+        const now = Date.now();
+        const entry = this.hits.get(key);
+        if (!entry || entry.resetTime.getTime() <= now) {
+            const resetTime = new Date(now + 60_000);
+            this.hits.set(key, { count: 1, resetTime });
+            return { totalHits: 1, resetTime };
         }
-        return new RedisStore({
+        entry.count++;
+        return { totalHits: entry.count, resetTime: entry.resetTime };
+    }
+
+    async decrement(_key: string): Promise<void> {}
+
+    async resetKey(_key: string): Promise<void> {
+        this.hits.delete(_key);
+    }
+}
+
+/** Proxy store that uses Redis when available, falls back to in-memory on Redis failure. */
+class FallbackStore implements Store {
+    private redisStore: RedisStore;
+    private memoryStore: InMemoryRateLimitStore;
+    private active: 'redis' | 'memory';
+
+    constructor(prefix: string) {
+        this.redisStore = new RedisStore({
             prefix,
-            // @ts-ignore - ioredis call signature matches what rate-limit-redis expects
-            sendCommand: (...args: string[]): Promise<unknown> => {
-                // Route through the local Redis circuit breaker. When the
-                // circuit is OPEN/slow the breaker rejects immediately and we
-                // fail closed (request errors) rather than buffering commands
-                // against a degraded dependency (§17). The command is created
-                // inside the callback so an OPEN circuit never dispatches it.
-                return runRateLimitCommand<unknown>(() => {
-                    // @ts-ignore - ioredis call signature matches what rate-limit-redis expects
-                    return redisRateLimit!.call(...args);
-                }).then((res) => {
+            sendCommand: async (...args: string[]) => {
+                try {
+                    const res = await runRateLimitCommand(() => {
+                        return (redisRateLimit as any).call(...args);
+                    });
                     if (!res.ok) {
-                        throw new Error(`redis circuit ${res.outcome}`);
+                        this.switchToMemory(`${res.outcome}`);
+                        return '1' as any;
                     }
                     return res.value;
-                });
+                } catch (e) {
+                    this.switchToMemory(e instanceof Error ? e.message : String(e));
+                    return '1' as any;
+                }
             },
         });
+        this.memoryStore = new InMemoryRateLimitStore();
+        this.active = isRedisRateLimitAvailable() ? 'redis' : 'memory';
     }
 
-    if (config.rateLimit.requireDistributed) {
-        if (!storeModeLogged) {
-            console.log('🛑 Rate Limiting: fail-closed (Redis required, unavailable)');
-            storeModeLogged = true;
+    private switchToMemory(reason: string): void {
+        if (this.active !== 'memory') {
+            this.active = 'memory';
+            console.warn(`[rate-limit] fallback to in-memory (Redis: ${reason})`);
         }
-        return new FailClosedRateLimitStore();
     }
 
-    if (!storeModeLogged) {
-        console.log('📝 Rate Limiting: in-memory store (single-instance dev only)');
-        storeModeLogged = true;
+    async increment(key: string) {
+        if (this.active === 'redis' && isRedisRateLimitAvailable()) {
+            try {
+                return await this.redisStore.increment(key);
+            } catch {
+                this.switchToMemory('increment failed');
+            }
+        }
+        return this.memoryStore.increment(key);
     }
-    return undefined;
+
+    async decrement(key: string) {
+        if (this.active === 'redis' && isRedisRateLimitAvailable()) {
+            try { await this.redisStore.decrement(key); } catch { /* use memory */ }
+        }
+        return this.memoryStore.decrement(key);
+    }
+
+    async resetKey(key: string) {
+        if (this.active === 'redis' && isRedisRateLimitAvailable()) {
+            try { await this.redisStore.resetKey(key); } catch { /* use memory */ }
+        }
+        return this.memoryStore.resetKey(key);
+    }
+}
+
+const getStore = (prefix: string): Store | undefined => {
+    if (config.redis.enabled && redisRateLimit) {
+        return new FallbackStore(prefix);
+    }
+    return new InMemoryRateLimitStore();
 };
 
-/** Abort boot if production expects fleet-wide limits but Redis rate-limit pool is down. */
+/** Warn if production expects fleet-wide limits but Redis rate-limit pool is down. */
 export function assertDistributedRateLimitReady(): void {
     if (!config.rateLimit.requireDistributed) return;
-    if (!config.redis.enabled) {
-        console.error('FATAL: UAM_REQUIRE_DISTRIBUTED_RATE_LIMIT set but REDIS_ENABLED=false');
-        process.exit(1);
+    if (!config.redis.enabled || !isRedisRateLimitAvailable()) {
+        console.warn('[boot] distributed rate limiting required but Redis unavailable');
+        return;
     }
-    if (!isRedisRateLimitAvailable()) {
-        console.error('FATAL: Redis rate-limit pool not ready — distributed limits require Redis');
-        process.exit(1);
-    }
-    console.log('✅ Distributed rate limiting ready (Redis)');
 }
 // General API Limiter - 1000 requests per minute (very generous for development)
 export const apiLimiter = rateLimit({

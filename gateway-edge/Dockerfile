@@ -16,7 +16,7 @@ WORKDIR /build
 COPY rust-ext/Cargo.toml rust-ext/Cargo.lock* ./
 RUN mkdir src && echo "" > src/lib.rs && cargo build --release || true
 COPY rust-ext/src ./src
-RUN touch src/lib.rs && cargo build --release && \
+RUN ls -la src/ && touch src/lib.rs && cargo build --release && \
     cp target/release/librust_ext.so /librust_ext.so
 
 # ── Stage 2: Config sidecar ─────────────────────────────────

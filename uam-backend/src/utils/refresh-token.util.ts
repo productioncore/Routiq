@@ -5,11 +5,10 @@ export function hashRefreshToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-/** Match presented token against stored hashes (supports legacy plaintext entries during rollout). */
+/** Match presented token against stored hashes. */
 export function findStoredRefreshToken(stored: string[] | undefined, presented: string): string | null {
     if (!stored?.length) return null;
     const hashed = hashRefreshToken(presented);
     if (stored.includes(hashed)) return hashed;
-    if (stored.includes(presented)) return presented;
     return null;
 }

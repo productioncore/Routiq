@@ -3,7 +3,7 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { Strategy as GitHubStrategy } from 'passport-github2';
 import { User, IUser } from '../models/User';
 import { config } from '../config';
-import { oauthProviderConflict } from '../utils/oauth.util';
+import { oauthProviderConflict, canOAuthTakeOverLocalAccount } from '../utils/oauth.util';
 import {
     findUserIdByOAuth,
     findUserIdByPrimaryEmail,
@@ -69,10 +69,26 @@ async function findUserForOAuth(
             const byNewEmail = await User.findById(primaryUserId);
             if (byNewEmail) user = byNewEmail;
         }
-    }
-
-    return user;
-}
+}
+
+    // Check if this is a local account that OAuth is trying to take over
+    if (user.provider === 'local') {
+        const canTakeOver = canOAuthTakeOverLocalAccount(user);
+        if (!canTakeOver) {
+            // Account is verified with password — block OAuth takeover
+            return null; // Will trigger conflict error in strategy
+        }
+        // Unverified local account — safe to take over, update provider
+        user.provider = provider;
+        user.providerId = providerId;
+        user.isEmailVerified = true;
+        await user.save();
+        await syncIdentityIndexesFromUser(user);
+        return user;
+    }
+
+    return user;
+}
 
 // Google OAuth Strategy
 if (config.google.clientId && config.google.clientSecret) {

@@ -75,23 +75,33 @@ export async function rotateSessionTokens(
         return false;
     }
 
-    const pulled = await User.findOneAndUpdate(
-        { _id: userId, refreshTokens: storedKey },
-        { $pull: { refreshTokens: storedKey } },
-    );
-    if (!pulled) {
+    const refreshHash = hashRefreshToken(refreshToken);
+    const jti = extractAccessJti(accessToken);
+
+    // Single atomic operation: pull old token AND push new ones.
+    // No race window between pull and push.
+    const update: Record<string, unknown> = {
+        $pull: { refreshTokens: storedKey },
+        $push: {
+            refreshTokens: { $each: [refreshHash], $slice: -MAX_REFRESH },
+        },
+    };
+    if (jti) {
+        (update.$push as Record<string, unknown>).activeAccessJtis = {
+            $each: [jti],
+            $slice: -MAX_JTIS,
+        };
+    }
+
+    const result = await User.findByIdAndUpdate(userId, update);
+    if (!result) {
         return false;
     }
 
-    try {
-        await persistSessionTokens(userId, accessToken, refreshToken, tokenVersion);
-        return true;
-    } catch {
-        await User.findByIdAndUpdate(userId, {
-            $push: { refreshTokens: { $each: [storedKey], $slice: -MAX_REFRESH } },
-        });
-        return false;
+    if (tokenVersion !== undefined) {
+        await publishTokenVersion(userId, tokenVersion);
     }
+    return true;
 }
 
 export async function persistSessionTokens(
