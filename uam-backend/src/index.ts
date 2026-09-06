@@ -100,7 +100,10 @@ app.use(
                 'http://localhost:3000',
                 'http://localhost:8091',
                 'http://127.0.0.1:8091',
+                'http://localhost:4321',
+                'http://127.0.0.1:4321',
                 config.clientUrl,
+                ...config.clientUrls,
             ];
             if (allowedOrigins.indexOf(origin) !== -1) {
                 callback(null, true);

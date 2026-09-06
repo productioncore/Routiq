@@ -106,7 +106,19 @@ export const config = {
         pass: process.env.SMTP_PASS || '',
     },
 
-    clientUrl: process.env.CLIENT_URL || 'http://localhost:5173',
+    clientUrl: (process.env.CLIENT_URL || 'http://localhost:5173').split(',')[0].trim() || 'http://localhost:5173',
+
+    /**
+     * Multi-client OAuth allowlist (multi-app support).
+     * CLIENT_URL may be a comma-separated list, e.g.
+     *   CLIENT_URL=https://uam-frontend.onrender.com,https://productioncore.dev
+     * First entry is the primary/default client (backwards compatible).
+     * OAuth `redirectUri` values are validated against these origins.
+     */
+    clientUrls: (process.env.CLIENT_URL || 'http://localhost:5173')
+        .split(',')
+        .map((s) => s.trim().replace(/\/$/, ''))
+        .filter(Boolean),
 
     cookies: {
         secure:

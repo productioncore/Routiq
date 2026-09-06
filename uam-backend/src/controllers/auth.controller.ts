@@ -5,7 +5,7 @@ import { User, IUser } from '../models/User';
 import { generateTokenPair, verifyRefreshToken, verifyAccessToken } from '../services/token.service';
 import { revokeAccessToken } from '../services/revoke.service';
 import { createOAuthExchangeCode, consumeOAuthExchangeCode } from '../services/oauth-exchange.service';
-import { createOAuthState, consumeOAuthState } from '../services/oauth-pkce.service';
+import { createOAuthState, consumeOAuthState, peekOAuthStateRedirectUri, resolveClientRedirectUri } from '../services/oauth-pkce.service';
 import {
     redeemEmailLinkCode,
     consumeFormToken,
@@ -695,13 +695,25 @@ export const getOAuthProviders = (_req: Request, res: Response): void => {
 
 export const prepareOAuth = async (req: Request, res: Response): Promise<void> => {
     try {
-        const { codeChallenge } = req.body as { codeChallenge?: string };
+        const { codeChallenge, redirectUri } = req.body as { codeChallenge?: string; redirectUri?: string };
         if (!codeChallenge) {
             res.status(400).json({ success: false, message: 'codeChallenge is required' });
             return;
         }
 
-        const state = await createOAuthState(codeChallenge);
+        // Optional per-client callback (multi-app support). Rejected when
+        // not on the CLIENT_URL allowlist — client falls back to primary.
+        let resolvedRedirect: string | undefined;
+        if (redirectUri !== undefined) {
+            const resolved = resolveClientRedirectUri(redirectUri);
+            if (!resolved) {
+                res.status(400).json({ success: false, message: 'redirectUri is not allowed' });
+                return;
+            }
+            resolvedRedirect = resolved;
+        }
+
+        const state = await createOAuthState(codeChallenge, resolvedRedirect);
         res.json({ success: true, state });
     } catch {
         res.status(500).json({ success: false, message: 'Failed to prepare OAuth' });
@@ -709,13 +721,16 @@ export const prepareOAuth = async (req: Request, res: Response): Promise<void> =
 };
 
 // Handle OAuth callback success — redirect with one-time code + state, not tokens in URL.
+// Redirect target is the per-client callback bound at prepare time (multi-app
+// support), falling back to the primary CLIENT_URL for legacy clients.
 export const handleOAuthSuccess = async (req: Request, res: Response): Promise<void> => {
+    const defaultBase = config.clientUrl;
     try {
         const user = (req as any).user as IUser | undefined;
         const state = typeof req.query.state === 'string' ? req.query.state : '';
 
         if (!user || !state) {
-            res.redirect(`${process.env.CLIENT_URL || 'http://localhost:5173'}/login?error=oauth_failed`);
+            res.redirect(`${defaultBase}/login?error=oauth_failed`);
             return;
         }
 
@@ -723,10 +738,11 @@ export const handleOAuthSuccess = async (req: Request, res: Response): Promise<v
         await persistSessionTokens(user._id, accessToken, refreshToken, user.tokenVersion ?? 0);
 
         const code = await createOAuthExchangeCode(accessToken, refreshToken, state);
-        const redirectUrl = `${process.env.CLIENT_URL || 'http://localhost:5173'}/oauth-callback?code=${code}&state=${encodeURIComponent(state)}`;
+        const clientCallback = (await peekOAuthStateRedirectUri(state)) || `${defaultBase}/oauth-callback`;
+        const redirectUrl = `${clientCallback}?code=${code}&state=${encodeURIComponent(state)}`;
         res.redirect(redirectUrl);
     } catch (error) {
-        res.redirect(`${process.env.CLIENT_URL || 'http://localhost:5173'}/login?error=oauth_failed`);
+        res.redirect(`${defaultBase}/login?error=oauth_failed`);
     }
 };
 

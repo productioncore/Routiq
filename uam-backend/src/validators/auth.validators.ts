@@ -76,6 +76,8 @@ export const redeemEmailLinkSchema = z.object({
 
 export const oauthPrepareSchema = z.object({
     codeChallenge: z.string().min(43).max(128),
+    /** Optional per-client callback, e.g. https://productioncore.dev/oauth-callback (allowlisted). */
+    redirectUri: z.string().url().max(200).optional(),
 });
 
 export const oauthExchangeSchema = z.object({
