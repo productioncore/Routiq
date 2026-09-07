@@ -11,10 +11,13 @@ use actix_web::{web, App, HttpServer, HttpResponse, Responder};
 use actix_web::HttpRequest;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -179,11 +182,107 @@ type LiveConfig = Arc<ArcSwap<ConfigSnapshot>>;
 /// Writes are rare (human-triggered), so a Mutex is fine here.
 type WriteStore = Arc<Mutex<ConfigStore>>;
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ── Config revision + event model (hybrid delivery: snapshot → SSE → reconcile) ──
+//
+// Every mutation produces a monotonically increasing revision. Edges track
+// the last revision they applied; SSE carries metadata-only events and the
+// edge re-fetches the snapshot — full state transfer, no delta-merge risk.
+
+/// Ring capacity for reconnect replay. Covers short disconnects; older gaps
+/// force a snapshot fetch via `config_stale`.
+const EVENT_RING_CAP: usize = 128;
+/// SSE heartbeat interval — keeps Render/proxy idle timeouts from killing
+/// long-lived streams (proxies typically cut idle conns at 60–100s).
+const SSE_HEARTBEAT_SECS: u64 = 25;
+/// Reconnect hint sent to edges (`retry:` field), plus edge-side jitter.
+const SSE_RETRY_MS: u64 = 10_000;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ConfigEvent {
+    pub revision: u64,
+    pub version: String,
+    pub timestamp: u64,
+    /// Event kind — currently always "FULL_SYNC" (metadata; edge fetches).
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+fn new_config_event(revision: u64, version: &str) -> ConfigEvent {
+    ConfigEvent {
+        revision,
+        version: version.to_string(),
+        timestamp: now_secs(),
+        kind: "FULL_SYNC".to_string(),
+    }
+}
+
+/// Pure reconnect recovery: which ring events does an edge with `last_id`
+/// still need? Returns (events with rev > last_id, stale) where stale means
+/// the ring no longer covers the gap and the edge must snapshot-fetch.
+pub fn select_missed_events(
+    ring: &VecDeque<ConfigEvent>,
+    last_id: u64,
+    cap: usize,
+) -> (Vec<ConfigEvent>, bool) {
+    if ring.is_empty() {
+        return (Vec::new(), last_id > 0);
+    }
+    let oldest = ring.front().map(|e| e.revision).unwrap_or(0);
+    let latest = ring.back().map(|e| e.revision).unwrap_or(0);
+    if last_id >= latest {
+        return (Vec::new(), false);
+    }
+    if last_id > 0 && last_id + 1 < oldest {
+        // Gap starts before retained history — entries were evicted.
+        return (Vec::new(), true);
+    }
+    let mut missed: Vec<ConfigEvent> = ring
+        .iter()
+        .filter(|e| e.revision > last_id)
+        .cloned()
+        .collect();
+    let stale = missed.len() > cap;
+    missed.truncate(cap);
+    (missed, stale)
+}
+
 #[derive(Clone)]
 struct AppState {
     live:  LiveConfig,
     store: WriteStore,
     db:    Option<store::Store>,
+    /// Monotonic config revision — bumped on every apply/rollback.
+    revision: Arc<AtomicU64>,
+    /// Recent events for reconnect replay (bounded ring).
+    events: Arc<Mutex<VecDeque<ConfigEvent>>>,
+    /// Fanout to SSE subscribers. One send per mutation regardless of edge
+    /// count — no per-edge database work on the hot path.
+    broadcaster: broadcast::Sender<ConfigEvent>,
+    /// Live SSE connections (observability).
+    sse_connections: Arc<AtomicU64>,
+}
+
+/// Publish a new revision: bump counter, record ring event, fanout.
+/// Send errors (no subscribers) are fine and ignored.
+fn publish_revision(state: &web::Data<AppState>, version: &str) -> ConfigEvent {
+    let revision = state.revision.fetch_add(1, Ordering::SeqCst) + 1;
+    let ev = new_config_event(revision, version);
+    if let Ok(mut ring) = state.events.lock() {
+        ring.push_back(ev.clone());
+        while ring.len() > EVENT_RING_CAP {
+            ring.pop_front();
+        }
+    }
+    let _ = state.broadcaster.send(ev.clone());
+    log::info!("Config revision {revision} published (version {version})");
+    ev
 }
 
 // ── Admin API authentication ──────────────────────────────────────────────────
@@ -260,10 +359,10 @@ fn check_and_record_admin_nonce(nonce: &str, now: u64) -> bool {
 ///   `X-Admin-Signature` — `sha256=<hex(HMAC-SHA256(signing_material))>`
 fn verify_admin_signature(req: &HttpRequest, body_bytes: &[u8]) -> bool {
     let admin_key = std::env::var("ADMIN_API_KEY")
-        .unwrap_or_else(|_| "change_me_in_production".to_string());
+        .unwrap_or_else(|_| "CHANGE_ME_ADMIN_API_KEY".to_string());
 
     // In dev mode (key == default), skip verification to allow easy testing
-    if admin_key == "change_me_in_production" {
+    if admin_key == "CHANGE_ME_ADMIN_API_KEY" {
         log::warn!("ADMIN_API_KEY is default — skipping signature verification (dev mode)");
         return true;
     }
@@ -335,11 +434,11 @@ fn verify_hmac_signature(admin_key: &str, body_bytes: &[u8], sig_header: &str) -
 /// Warn or exit when ADMIN_API_KEY is a known dev default (ADR-0041 parity).
 fn warn_insecure_admin_key() {
     const DEV_KEYS: &[&str] = &[
-        "change_me_in_production",
+        "CHANGE_ME_ADMIN_API_KEY",
         "change_me_use_a_long_random_admin_key",
     ];
     let key = std::env::var("ADMIN_API_KEY")
-        .unwrap_or_else(|_| "change_me_in_production".to_string());
+        .unwrap_or_else(|_| "CHANGE_ME_ADMIN_API_KEY".to_string());
     if !DEV_KEYS.iter().any(|d| key == *d) {
         return;
     }
@@ -437,14 +536,206 @@ fn verify_config_read_token(req: &HttpRequest) -> bool {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// GET /config — lock-free read, served to all gateway nodes every 5s
+/// Snapshot envelope: full config + revision metadata. Extra fields are
+/// ignored by older edge parsers, so this stays wire-compatible.
+#[derive(Serialize)]
+struct SnapshotEnvelope<'a> {
+    #[serde(flatten)]
+    snapshot: &'a ConfigSnapshot,
+    revision: u64,
+    timestamp: u64,
+}
+
+#[derive(Serialize)]
+struct VersionInfo {
+    revision: u64,
+    version: String,
+    timestamp: u64,
+}
+
+fn version_etag(revision: u64) -> String {
+    format!("W/\"rev-{revision}\"")
+}
+
+/// GET /config — lock-free snapshot read with revision envelope.
 async fn get_config(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if !verify_config_read_token(&req) {
         log::warn!("GET /config rejected: missing or invalid X-Config-Read-Token");
         return HttpResponse::Unauthorized().body("Missing or invalid X-Config-Read-Token");
     }
     let snap = state.live.load_full();
-    HttpResponse::Ok().json(snap.as_ref())
+    let body = SnapshotEnvelope {
+        snapshot: snap.as_ref(),
+        revision: state.revision.load(Ordering::SeqCst),
+        timestamp: now_secs(),
+    };
+    HttpResponse::Ok().json(body)
+}
+
+/// GET /config/version — lightweight revision check for periodic
+/// reconciliation. Supports `If-None-Match` (ETag `W/"rev-N"`) → 304.
+async fn config_version(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if !verify_config_read_token(&req) {
+        log::warn!("GET /config/version rejected: missing or invalid X-Config-Read-Token");
+        return HttpResponse::Unauthorized().body("Missing or invalid X-Config-Read-Token");
+    }
+    let revision = state.revision.load(Ordering::SeqCst);
+    let etag = version_etag(revision);
+    if let Some(inm) = req.headers().get("If-None-Match") {
+        if inm.to_str().map(|s| s.trim() == etag).unwrap_or(false) {
+            return HttpResponse::NotModified().finish();
+        }
+    }
+    let snap = state.live.load_full();
+    HttpResponse::Ok()
+        .insert_header(("ETag", etag))
+        .insert_header(("Cache-Control", "no-store"))
+        .json(VersionInfo {
+            revision,
+            version: snap.version.clone(),
+            timestamp: now_secs(),
+        })
+}
+
+fn sse_frame(id: Option<u64>, event: &str, data: &str) -> actix_web::web::Bytes {
+    let mut s = String::with_capacity(data.len() + 64);
+    if let Some(id) = id {
+        s.push_str(&format!("id: {id}\n"));
+    }
+    s.push_str(&format!("event: {event}\n"));
+    for line in data.lines() {
+        s.push_str(&format!("data: {line}\n"));
+    }
+    s.push('\n');
+    actix_web::web::Bytes::from(s)
+}
+
+fn config_changed_frame(ev: &ConfigEvent) -> actix_web::web::Bytes {
+    let data = serde_json::json!({
+        "revision": ev.revision,
+        "configVersion": ev.version,
+        "timestamp": ev.timestamp,
+        "type": ev.kind,
+    });
+    sse_frame(Some(ev.revision), "config_changed", &data.to_string())
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    #[serde(default)]
+    edge_id: String,
+}
+
+/// GET /config/stream — SSE change stream for edge nodes.
+///
+/// Auth: `X-Config-Read-Token` (same as snapshot reads).
+/// Identity: `?edge_id=` (truncated to 64 chars, observability only).
+/// Resume: `Last-Event-ID` header (last applied revision). Missed events
+/// still in the ring are replayed; evicted gaps get `config_stale`
+/// (edge must snapshot-fetch). Heartbeats every SSE_HEARTBEAT_SECS keep
+/// proxies from killing idle streams; `retry:` tells edges when to return.
+async fn config_stream(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<StreamQuery>,
+) -> impl Responder {
+    if !verify_config_read_token(&req) {
+        log::warn!("GET /config/stream rejected: missing or invalid X-Config-Read-Token");
+        return HttpResponse::Unauthorized().body("Missing or invalid X-Config-Read-Token");
+    }
+    let edge_id: String = {
+        let mut id = query.edge_id.trim().to_string();
+        if id.is_empty() {
+            id = "unknown".to_string();
+        }
+        id.truncate(64);
+        id
+    };
+    let last_id: u64 = req
+        .headers()
+        .get("Last-Event-ID")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    // Subscribe BEFORE replaying so no event slips between replay and live.
+    let mut rx = state.broadcaster.subscribe();
+    let (missed, stale) = match state.events.lock() {
+        Ok(ring) => select_missed_events(&ring, last_id, EVENT_RING_CAP),
+        Err(_) => (Vec::new(), true),
+    };
+    let latest = state.revision.load(Ordering::SeqCst);
+    state.sse_connections.fetch_add(1, Ordering::SeqCst);
+    log::info!("SSE connected: edge={edge_id} last_id={last_id} replay={} stale={stale} live_rev={latest} conns={}",
+        missed.len(),
+        state.sse_connections.load(Ordering::SeqCst));
+
+    struct ConnGuard(Arc<AtomicU64>, String);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+            log::info!("SSE disconnected: edge={} conns={}", self.1, self.0.load(Ordering::SeqCst));
+        }
+    }
+    let guard = ConnGuard(state.sse_connections.clone(), edge_id.clone());
+
+    // Infallible error type: every frame is producible, so the pump task
+    // never needs to fail the stream (also keeps the future Send).
+    let (tx, rx_stream) = tokio::sync::mpsc::unbounded_channel::<
+        Result<actix_web::web::Bytes, std::convert::Infallible>,
+    >();
+    let edge_id_task = edge_id.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let send = |b: actix_web::web::Bytes| tx.send(Ok(b)).is_ok();
+        send(actix_web::web::Bytes::from(format!("retry: {SSE_RETRY_MS}\n\n")));
+        if stale {
+            send(sse_frame(None, "config_stale", &serde_json::json!({
+                "message": "revision gap exceeds retained history — snapshot fetch required",
+                "latestRevision": latest,
+            }).to_string()));
+        }
+        for ev in &missed {
+            if !send(config_changed_frame(ev)) {
+                return;
+            }
+        }
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(SSE_HEARTBEAT_SECS));
+        // First tick fires immediately — skip it so we don't heartbeat on connect.
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    let frame = sse_frame(None, "heartbeat",
+                        &serde_json::json!({ "ts": now_secs(), "latestRevision": latest }).to_string());
+                    if !send(frame) { return; }
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(ev) => {
+                            if !send(config_changed_frame(&ev)) { return; }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Fell behind the fanout buffer — force reconcile, never guess.
+                            let frame = sse_frame(None, "config_stale", &serde_json::json!({
+                                "message": "subscriber lagged behind fanout buffer — snapshot fetch required",
+                            }).to_string());
+                            if !send(frame) { return; }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    });
+
+    let _ = edge_id_task;
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .insert_header(("Connection", "keep-alive"))
+        .streaming(tokio_stream::wrappers::UnboundedReceiverStream::new(rx_stream))
 }
 
 /// POST /config — push a new config version (requires X-Admin-Signature).
@@ -537,10 +828,12 @@ async fn post_config(
         Ok(mut store) => {
             store.push(new_snap.clone());
             state.live.store(Arc::new(new_snap));
-            log::info!("Config updated to version {version}");
+            let ev = publish_revision(&state, &version);
+            log::info!("Config updated to version {version} (revision {})", ev.revision);
             HttpResponse::Ok().json(serde_json::json!({
                 "status": "applied",
                 "version": version,
+                "revision": ev.revision,
                 "warnings": report.warnings,
                 "diff": diff,
             }))
@@ -569,7 +862,10 @@ async fn rollback_config(req: HttpRequest, state: web::Data<AppState>) -> impl R
         store.current().clone()
     };
     state.live.store(Arc::new(prev.clone()));
-    log::info!("Config rolled back to version {}", prev.version);
+    // Rollback publishes a NEW revision pointing at old content — revisions
+    // stay monotonic even when versions move backwards.
+    let ev = publish_revision(&state, &prev.version);
+    log::info!("Config rolled back to version {} (revision {})", prev.version, ev.revision);
 
     // Durable-first: record the rollback BEFORE responding success.
     if let Some(db) = &state.db {
@@ -597,6 +893,7 @@ async fn rollback_config(req: HttpRequest, state: web::Data<AppState>) -> impl R
     HttpResponse::Ok().json(serde_json::json!({
         "status": "rolled_back",
         "version": prev.version,
+        "revision": ev.revision,
     }))
 }
 
@@ -830,6 +1127,8 @@ async fn health(req: HttpRequest, state: web::Data<AppState>) -> impl Responder 
         "service":       "control-plane",
         "redis_circuit": redis_state,
         "postgres":      pg_state,
+        "revision":      state.revision.load(Ordering::SeqCst),
+        "sse_connections": state.sse_connections.load(Ordering::SeqCst),
     }))
 }
 
@@ -845,6 +1144,8 @@ async fn metrics(state: web::Data<AppState>) -> impl Responder {
         .lock()
         .map(|s| s.history.len())
         .unwrap_or(0);
+    let revision = state.revision.load(Ordering::SeqCst);
+    let sse_conns = state.sse_connections.load(Ordering::SeqCst);
 
     let body = format!(
         "# HELP control_plane_up Control plane process is up\n\
@@ -859,6 +1160,12 @@ async fn metrics(state: web::Data<AppState>) -> impl Responder {
          # HELP control_plane_config_history Versions retained in history\n\
          # TYPE control_plane_config_history gauge\n\
          control_plane_config_history {history}\n\
+         # HELP control_plane_config_revision Monotonic config revision served to edges\n\
+         # TYPE control_plane_config_revision gauge\n\
+         control_plane_config_revision {revision}\n\
+         # HELP control_plane_sse_connections Live SSE stream connections from edges\n\
+         # TYPE control_plane_sse_connections gauge\n\
+         control_plane_sse_connections {sse_conns}\n\
          {}\n",
         redis_cb::prometheus_metrics()
     );
@@ -1071,7 +1378,30 @@ async fn main() -> std::io::Result<()> {
     let live  = Arc::new(ArcSwap::from_pointee(initial.clone()));
     let store = Arc::new(Mutex::new(ConfigStore { history, history_limit }));
 
-    let app_state = web::Data::new(AppState { live, store, db });
+    // Revision seed: one revision per durable record keeps monotonicity
+    // across restarts (best-effort — records predate revision tracking).
+    let seed_revision = {
+        let h = store.lock().map(|s| s.history.len()).unwrap_or(1).max(1) as u64;
+        h
+    };
+    let (broadcaster, _) = broadcast::channel::<ConfigEvent>(256);
+    let seed_event = new_config_event(seed_revision, &initial.version);
+    let mut seed_ring = VecDeque::with_capacity(EVENT_RING_CAP);
+    seed_ring.push_back(seed_event.clone());
+    log::info!(
+        "Config revision seeded at {} (version {})",
+        seed_revision, initial.version
+    );
+
+    let app_state = web::Data::new(AppState {
+        live,
+        store,
+        db,
+        revision: Arc::new(AtomicU64::new(seed_revision)),
+        events: Arc::new(Mutex::new(seed_ring)),
+        broadcaster,
+        sse_connections: Arc::new(AtomicU64::new(0)),
+    });
 
     let port    = std::env::var("PORT").unwrap_or_else(|_| "8081".to_string());
     let workers = std::env::var("WORKERS")
@@ -1090,6 +1420,8 @@ async fn main() -> std::io::Result<()> {
             .route("/metrics",         web::get().to(metrics))
             .route("/config",          web::get().to(get_config))
             .route("/config",          web::post().to(post_config))
+            .route("/config/version",  web::get().to(config_version))
+            .route("/config/stream",   web::get().to(config_stream))
             .route("/config/rollback", web::post().to(rollback_config))
             .route("/config/history",  web::get().to(config_history))
             .route("/config/audit",    web::get().to(config_audit))
@@ -1147,6 +1479,67 @@ mod tests {
         let key = "super-admin-key";
         let body = br#"{"version":"v2"}"#;
         assert!(verify_hmac_signature(key, body, &sign(key, body)));
+    }
+
+    fn test_ring(revs: &[u64]) -> VecDeque<ConfigEvent> {
+        revs.iter()
+            .map(|r| new_config_event(*r, "v-test"))
+            .collect()
+    }
+
+    #[test]
+    fn replay_returns_only_newer_events() {
+        let ring = test_ring(&[101, 102, 103]);
+        let (missed, stale) = select_missed_events(&ring, 101, 128);
+        assert!(!stale);
+        assert_eq!(missed.iter().map(|e| e.revision).collect::<Vec<_>>(), vec![102, 103]);
+    }
+
+    #[test]
+    fn replay_at_latest_returns_nothing() {
+        let ring = test_ring(&[101, 102]);
+        let (missed, stale) = select_missed_events(&ring, 102, 128);
+        assert!(!stale);
+        assert!(missed.is_empty());
+    }
+
+    #[test]
+    fn replay_fresh_edge_gets_everything() {
+        let ring = test_ring(&[7, 8]);
+        let (missed, stale) = select_missed_events(&ring, 0, 128);
+        assert!(!stale);
+        assert_eq!(missed.len(), 2);
+    }
+
+    #[test]
+    fn replay_evicted_gap_forces_stale() {
+        // Ring retained 105..107; edge at 102 missed evicted entries.
+        let ring = test_ring(&[105, 106, 107]);
+        let (missed, stale) = select_missed_events(&ring, 102, 128);
+        assert!(stale);
+        assert!(missed.is_empty());
+    }
+
+    #[test]
+    fn replay_boundary_is_not_stale() {
+        // Edge at 104, oldest retained 105 → contiguous, no gap.
+        let ring = test_ring(&[105, 106]);
+        let (missed, stale) = select_missed_events(&ring, 104, 128);
+        assert!(!stale);
+        assert_eq!(missed.len(), 2);
+    }
+
+    #[test]
+    fn replay_respects_cap_and_flags_stale() {
+        let ring = test_ring(&[11, 12, 13, 14]);
+        let (missed, stale) = select_missed_events(&ring, 10, 2);
+        assert!(stale);
+        assert_eq!(missed.len(), 2);
+    }
+
+    #[test]
+    fn version_etag_roundtrip() {
+        assert_eq!(version_etag(105), "W/\"rev-105\"");
     }
 
     #[test]
@@ -1386,7 +1779,7 @@ mod tests {
 
     #[test]
     fn insecure_admin_key_detected() {
-        std::env::set_var("ADMIN_API_KEY", "change_me_in_production");
+        std::env::set_var("ADMIN_API_KEY", "CHANGE_ME_ADMIN_API_KEY");
         std::env::remove_var("CONTROL_PLANE_REFUSE_INSECURE_SECRETS");
         warn_insecure_admin_key();
         std::env::remove_var("ADMIN_API_KEY");

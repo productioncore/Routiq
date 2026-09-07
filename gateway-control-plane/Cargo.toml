@@ -41,4 +41,8 @@ tracing                = "0.1"
 tracing-subscriber     = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-log            = { version = "0.2", features = ["log-tracer"] }
 tracing-opentelemetry  = "0.33"
+# SSE config stream: broadcast fanout to edge nodes + stream adapters.
+# (actix-web already runs on tokio; these are the direct-use pieces.)
+tokio        = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 opentelemetry-appender-tracing = "0.32"
